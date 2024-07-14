@@ -184,6 +184,7 @@ class FusedMoE(torch.nn.Module):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
 
+        self.quant_config = quant_config
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
                 UnquantizedFusedMoEMethod())
@@ -220,34 +221,93 @@ class FusedMoE(torch.nn.Module):
         # Default is not transposed/input dim is dim 1
         input_dim = getattr(param, "input_dim", 1)
         output_dim = getattr(param, "output_dim", 0)
+        pack_factor = getattr(self.quant_config, "pack_factor", 1)
 
-        # Index the loaded weight for tp sharding.
-        # down_proj: "RowParallel" so tp sharding on input_dim
-        if shard_id == "w2":
-            shard_dim = input_dim
-            shard_size = expert_data.shape[shard_dim]
-        # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
-        elif shard_id in ("w1", "w3"):
-            shard_dim = output_dim
-            shard_size = expert_data.shape[output_dim] // 2
-        offset = shard_size * tp_rank
-        loaded_weight = loaded_weight.narrow(shard_dim, offset, shard_size)
+        if 'scales' in weight_name or 'qzeros' in weight_name:
+            # for gptq models
+            assert self.quant_config is not None
+            group_size = getattr(self.quant_config, "group_size", -1)
+            tp_rank = get_tensor_model_parallel_rank()
+            if 'scales' in weight_name:
+                if shard_id == "w2":
+                    shard_size = self.intermediate_size_per_partition
+                    if group_size != -1:
+                        shard_size //= group_size
+                else:
+                    shard_size = self.intermediate_size_per_partition
+            else:
+                if shard_id == "w2":
+                    shard_size = self.intermediate_size_per_partition
+                    if group_size != -1:
+                        shard_size //= group_size
+                else:
+                    shard_size = (self.intermediate_size_per_partition //
+                                  pack_factor)
+            shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
 
-        # Narrow parameter and load.
-        # w1, gate_proj: Load into first logical weight of w13.
-        if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
-            expert_data.copy_(loaded_weight)
-        # w3, up_proj: Load into second logical weight of w13.
-        elif shard_id == "w3":
-            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-            expert_data.copy_(loaded_weight)
-        # w2, down_proj: Load into only logical weight of w2.
-        elif shard_id == "w2":
-            expert_data.copy_(loaded_weight)
+            # If we are in merged column case (gate_up_proj)
+            if shard_id == "w1":
+                expert_data[:, 0:shard_size] = loaded_weight[:, shard]
+            elif shard_id == "w3":
+                expert_data[:,
+                           shard_size:2 * shard_size] = loaded_weight[:, shard]
+            # If we are in the row parallel case (down_proj)
+            elif shard_id == "w2":
+                expert_data = loaded_weight[shard]
+            else:
+                raise ValueError(
+                    f"Shard id must be in [0,1,2] but got {shard_id}")
+        # Weights
+        if not self.quant_config or self.quant_config.get_name() == "fp8":
+            # Index the loaded weight for tp sharding.
+            # down_proj: "RowParallel" so tp sharding on input_dim
+            if shard_id == "w2":
+                shard_dim = input_dim
+                shard_size = expert_data.shape[shard_dim]
+            # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
+            elif shard_id in ("w1", "w3"):
+                shard_dim = output_dim
+                shard_size = expert_data.shape[output_dim] // 2
+            offset = shard_size * tp_rank
+            loaded_weight = loaded_weight.narrow(shard_dim, offset, shard_size)
+
+            # Narrow parameter and load.
+            # w1, gate_proj: Load into first logical weight of w13.
+            if shard_id == "w1":
+                expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+                expert_data.copy_(loaded_weight)
+            # w3, up_proj: Load into second logical weight of w13.
+            elif shard_id == "w3":
+                expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+                expert_data.copy_(loaded_weight)
+            # w2, down_proj: Load into only logical weight of w2.
+            elif shard_id == "w2":
+                expert_data.copy_(loaded_weight)
+            else:
+                raise ValueError(
+                    f"Expected shard_id w1,w2 or w3 but got {shard_id}")
         else:
-            raise ValueError(
-                f"Expected shard_id w1,w2 or w3 but got {shard_id}")
+            tp_rank = get_tensor_model_parallel_rank()
+            if shard_id == "w2":
+                shard_size = (self.intermediate_size_per_partition //
+                              pack_factor)
+            else:
+                shard_size = self.intermediate_size_per_partition
+            shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+
+            # w1, gate_proj case: Load into first shard of w13.
+            if shard_id == "w1":
+                expert_data[:, 0:shard_size] = loaded_weight[:, shard]
+            # w3, up_proj case: Load into second shard of w13.
+            elif shard_id == "w3":
+                expert_data[:,
+                           shard_size:2 * shard_size] = loaded_weight[:, shard]
+            # w2, down_proj case: Load into only shard of w2.
+            elif shard_id == "w2":
+                expert_data = loaded_weight[shard, :]
+            else:
+                raise ValueError(
+                    f"Shard id must be in [0,1,2] but got {shard_id}")
 
     @staticmethod
     def select_experts(hidden_states: torch.Tensor,
