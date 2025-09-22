@@ -637,30 +637,33 @@ direct_register_custom_op(
 
 
 def creat_attn_output_buffer(
-    output_shape: torch.Size,
+    output_shape: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
     need_init: bool,
 ) -> torch.Tensor:
+    # Convert tensor to tuple for shape
+    shape = tuple(output_shape.tolist())
     if need_init:
         # Avoid output contains NaNs, which causes numerical issue during
         # profile run. See: https://github.com/vllm-project/vllm/pull/19784
-        return torch.zeros(output_shape,
+        return torch.zeros(shape,
                             dtype=dtype,
                             device=device)
     else:
-        return torch.empty(output_shape,
+        return torch.empty(shape,
                                 dtype=dtype,
                                 device=device)
 
 
 def creat_attn_output_buffer_fake(
-    output_shape: torch.Size,
+    output_shape: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
     need_init: bool,
 ) -> torch.Tensor:
-    return torch.empty(output_shape,
+    shape = tuple(output_shape.tolist())
+    return torch.empty(shape,
                             dtype=dtype,
                             device=device)
 
