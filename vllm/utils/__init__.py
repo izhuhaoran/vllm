@@ -2554,10 +2554,21 @@ def direct_register_custom_op(
         import torch._custom_op.impl
         schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
     my_lib = target_lib or vllm_lib
-    my_lib.define(op_name + schema_str, tags=tags)
-    my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
-    if fake_impl is not None:
-        my_lib._register_fake(op_name, fake_impl)
+    
+    try:
+        my_lib.define(op_name + schema_str, tags=tags)
+        my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
+        if fake_impl is not None:
+            my_lib._register_fake(op_name, fake_impl)
+    except RuntimeError as e:
+        # Handle duplicate registration gracefully
+        if "Tried to register an operator" in str(e) and "multiple times" in str(e):
+            # The operation is already registered, which is fine
+            # This can happen when modules are imported multiple times
+            pass
+        else:
+            # Re-raise other RuntimeErrors as they indicate real problems
+            raise
 
 
 def resolve_obj_by_qualname(qualname: str) -> Any:
